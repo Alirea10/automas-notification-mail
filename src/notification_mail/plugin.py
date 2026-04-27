@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import html as html_lib
+import mimetypes
 import re
 import smtplib
+from email import encoders
 from email.header import Header
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,6 +20,7 @@ from .schema import Config
 
 
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+LOG_INLINE_LIMIT = 4000
 
 
 class MailChannel:
@@ -32,11 +38,9 @@ class MailChannel:
         title = str(payload.get("title") or "AUTO-MAS 通知")
         self._validate(to_address)
 
-        if mode == "网页":
-            message = MIMEMultipart("alternative")
-            message.attach(MIMEText(content, "html", "utf-8"))
-        else:
-            message = MIMEText(content, "plain", "utf-8")
+        content = self._append_extra_to_content(content, mode, payload)
+        attachments = self._build_extra_attachments(payload)
+        message = self._build_message(mode, content, attachments)
 
         message["From"] = formataddr((Header(self.config.sender_name, "utf-8").encode(), self.config.from_address))
         message["To"] = formataddr((Header(self.config.receiver_name, "utf-8").encode(), to_address))
@@ -55,9 +59,122 @@ class MailChannel:
         self.ctx.logger.info(f"[notification_mail] 邮件已发送: {title}")
         return True
 
+    def _build_message(self, mode: str, content: str, attachments: list[MIMEBase]) -> MIMEMultipart | MIMEText:
+        if attachments:
+            message = MIMEMultipart("mixed")
+            if mode == "网页":
+                alternative = MIMEMultipart("alternative")
+                alternative.attach(MIMEText(content, "html", "utf-8"))
+                message.attach(alternative)
+            else:
+                message.attach(MIMEText(content, "plain", "utf-8"))
+            for attachment in attachments:
+                message.attach(attachment)
+            return message
+
+        if mode == "网页":
+            message = MIMEMultipart("alternative")
+            message.attach(MIMEText(content, "html", "utf-8"))
+            return message
+        return MIMEText(content, "plain", "utf-8")
+
+    def _append_extra_to_content(self, content: str, mode: str, payload: dict[str, Any]) -> str:
+        extra_text = self._render_extra_text(payload, inline_long_logs=False)
+        if not extra_text:
+            return content
+        if mode == "网页":
+            return f"{content}<hr><pre>{html_lib.escape(extra_text)}</pre>"
+        return f"{content}\n\n--- Extra ---\n{extra_text}"
+
+    def _render_extra_text(self, payload: dict[str, Any], *, inline_long_logs: bool) -> str:
+        extra = payload.get("extra")
+        if not isinstance(extra, dict):
+            return ""
+
+        sections: list[str] = []
+        logs = [item for item in extra.get("logs") or [] if isinstance(item, dict)]
+        if logs:
+            rendered_logs = []
+            for index, item in enumerate(logs, start=1):
+                name = str(item.get("name") or f"log-{index}.txt")
+                level = str(item.get("level") or "info")
+                content = str(item.get("content") or "")
+                if not inline_long_logs and len(content) > LOG_INLINE_LIMIT:
+                    rendered_logs.append(f"[{level}] {name}: attached as file")
+                else:
+                    rendered_logs.append(f"[{level}] {name}\n{content}")
+            sections.append("Logs:\n" + "\n\n".join(rendered_logs))
+
+        asset_lines = []
+        for key, label in (("images", "Image"), ("attachments", "Attachment")):
+            for index, item in enumerate(extra.get(key) or [], start=1):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("caption") or item.get("name") or item.get("path") or f"{key}-{index}")
+                path = str(item.get("path") or item.get("url") or "")
+                asset_lines.append(f"{label}: {name}" + (f" ({path})" if path else ""))
+        if asset_lines:
+            sections.append("Assets:\n" + "\n".join(asset_lines))
+
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _build_extra_attachments(self, payload: dict[str, Any]) -> list[MIMEBase]:
+        extra = payload.get("extra")
+        if not isinstance(extra, dict):
+            return []
+
+        attachments: list[MIMEBase] = []
+        for index, item in enumerate(extra.get("logs") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or "")
+            if len(content) <= LOG_INLINE_LIMIT:
+                continue
+            name = str(item.get("name") or f"log-{index}.txt")
+            attachments.append(self._text_attachment(name, content))
+
+        for key in ("images", "attachments"):
+            for item in extra.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                attachment = self._file_attachment(item)
+                if attachment is not None:
+                    attachments.append(attachment)
+
+        return attachments
+
+    def _text_attachment(self, name: str, content: str) -> MIMEBase:
+        part = MIMEBase("text", "plain")
+        part.set_payload(content.encode("utf-8"))
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=name)
+        part.add_header("Content-Type", "text/plain; charset=utf-8")
+        return part
+
+    def _file_attachment(self, item: dict[str, Any]) -> MIMEBase | None:
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.exists() or not path.is_file():
+            self.ctx.logger.warning(f"[notification_mail] extra attachment missing: {raw_path}")
+            return None
+
+        name = str(item.get("name") or path.name)
+        mime = str(item.get("mime") or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        maintype, _, subtype = mime.partition("/")
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(path.read_bytes())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=name)
+        return part
+
     def _validate(self, to_address: str) -> None:
         if not self.config.smtp_server:
-            raise ValueError("SMTP 服务器地址不能为空")
+            raise ValueError("SMTP 服务地址不能为空")
         if not self.config.authorization_code:
             raise ValueError("邮件授权码不能为空")
         if not EMAIL_RE.match(self.config.from_address):
