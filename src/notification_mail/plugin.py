@@ -33,8 +33,11 @@ class MailChannel:
             return False
 
         to_address = str(payload.get("to_address") or self.config.default_to_address).strip()
-        mode = str(payload.get("mail_mode") or ("网页" if payload.get("html") else "文本"))
-        content = str(payload.get("html") if mode == "网页" else payload.get("text") or "")
+        mode = str(payload.get("mail_mode") or "网页")
+        if mode == "网页":
+            content = self._render_html_content(payload)
+        else:
+            content = self._render_text_content(payload)
         title = str(payload.get("title") or "AUTO-MAS 通知")
         self._validate(to_address)
 
@@ -77,6 +80,52 @@ class MailChannel:
             message.attach(MIMEText(content, "html", "utf-8"))
             return message
         return MIMEText(content, "plain", "utf-8")
+
+    def _render_text_content(self, payload: dict[str, Any]) -> str:
+        explicit = payload.get("mail_content")
+        if explicit is not None:
+            return str(explicit)
+
+        text = str(payload.get("text") or "")
+        signature = str(payload.get("signature") or "").strip()
+        if signature:
+            return f"{text}\n\n{signature}"
+        return text
+
+    def _render_html_content(self, payload: dict[str, Any]) -> str:
+        explicit = payload.get("mail_content")
+        if explicit is not None and str(payload.get("mail_mode") or "") == "网页":
+            return str(explicit)
+
+        title = str(payload.get("title") or "AUTO-MAS 通知")
+        text = str(payload.get("text") or "")
+        signature = str(payload.get("signature") or "").strip()
+        data = payload.get("data")
+
+        parts = [
+            "<!doctype html>",
+            "<html>",
+            "<body>",
+            f"<h2>{html_lib.escape(title)}</h2>",
+            f"<p>{html_lib.escape(text).replace(chr(10), '<br>')}</p>",
+        ]
+
+        if isinstance(data, dict) and data:
+            parts.append("<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">")
+            for key, value in data.items():
+                parts.append(
+                    "<tr>"
+                    f"<th align=\"left\">{html_lib.escape(str(key))}</th>"
+                    f"<td>{html_lib.escape(str(value))}</td>"
+                    "</tr>"
+                )
+            parts.append("</table>")
+
+        if signature:
+            parts.append(f"<p><small>{html_lib.escape(signature)}</small></p>")
+
+        parts.extend(["</body>", "</html>"])
+        return "\n".join(parts)
 
     def _append_extra_to_content(self, content: str, mode: str, payload: dict[str, Any]) -> str:
         extra_text = self._render_extra_text(payload, inline_long_logs=False)
