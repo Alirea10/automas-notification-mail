@@ -59,7 +59,7 @@ class MailChannel:
         finally:
             smtp.quit()
 
-        self.ctx.logger.info(f"[notification_mail] 邮件已发送: {title}")
+        self.ctx.logger.info(f"邮件已发送: {title}")
         return True
 
     def _build_message(self, mode: str, content: str, attachments: list[MIMEBase]) -> MIMEMultipart | MIMEText:
@@ -206,7 +206,7 @@ class MailChannel:
             return None
         path = Path(raw_path)
         if not path.exists() or not path.is_file():
-            self.ctx.logger.warning(f"[notification_mail] extra attachment missing: {raw_path}")
+            self.ctx.logger.warning(f"extra attachment missing: {raw_path}")
             return None
 
         name = str(item.get("name") or path.name)
@@ -242,10 +242,10 @@ class Plugin:
         raw_config = self.ctx.config.to_dict() if hasattr(self.ctx.config, "to_dict") else dict(self.ctx.config)
         channel = MailChannel(self.ctx, Config.model_validate(raw_config))
         self.ctx.get("notify").register_channel("mail", channel)
-        self.ctx.logger.info("[notification_mail] 通道已启动")
+        self.ctx.logger.info("通道已启动")
 
     async def on_stop(self, reason: str) -> None:
         notify = self.ctx.get("notify")
         if notify is not None:
             notify.unregister_channel("mail")
-        self.ctx.logger.info(f"[notification_mail] 插件停止, reason={reason}")
+        self.ctx.logger.info(f"插件停止, reason={reason}")
